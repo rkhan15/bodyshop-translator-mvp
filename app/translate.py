@@ -1,5 +1,7 @@
 import io
 import re
+from typing import List, Tuple
+
 import pandas as pd
 import pdfplumber
 
@@ -59,7 +61,7 @@ def _spanish(op: str, desc: str) -> str:
         base = d  # fallback
 
     if side:
-        # crude gender rules for adjectives
+        # simple gender guess for adjectives
         fem = any(w in base for w in ["puerta", "moldura", "estructura"])
         adj = (side + "a") if fem else (side + "o")
         base = f"{base} {adj}"
@@ -74,18 +76,43 @@ def _spanish(op: str, desc: str) -> str:
     return base
 
 
-def _parse_rows_from_text(text: str) -> pd.DataFrame:
+def _extract_header_lines(page_text: str) -> List[str]:
     """
-    Parse 'table-ish' estimate text into rows.
-    MVP heuristic:
-      - Looks for the header line starting with 'Line' and containing 'Assigned'
-      - Supports ALL-CAPS section headers like: '2 PILLARS, ROCKER & FLOOR'
-      - Supports op rows like: '8 Remove / Install 0 DP5Z... LT Belt molding Body 0.3'
+    Pull the 'top box' info from the PDF text (everything above the table header).
+    We keep it as a list of lines to render on the translated PDF.
+    """
+    lines = [l.strip() for l in page_text.splitlines() if l.strip()]
+
+    # Stop when we reach the table header or "Work Order - ..."
+    stop_idx = len(lines)
+    for i, l in enumerate(lines):
+        if l.startswith("Work Order") or (l.startswith("Line") and "Assigned" in l):
+            stop_idx = i
+            break
+
+    header_lines = lines[:stop_idx]
+
+    # Light cleanup: remove trailing "Page 1" note if it sneaks in, keep useful metadata
+    cleaned = []
+    for l in header_lines:
+        if re.search(r"\bPage\s+\d+\b", l):
+            continue
+        cleaned.append(l)
+
+    return cleaned
+
+
+def _parse_rows_from_text(full_text: str) -> pd.DataFrame:
+    """
+    Parse the table section into rows.
+    Supports:
+      - ALL CAPS section headers like: "2 PILLARS, ROCKER & FLOOR"
+      - Op rows like: "8 Remove / Install 0 DP5Z... LT Belt molding Body 0.3"
     """
     rows = []
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
 
-    # Find start of table (heuristic)
+    # Find start of table
     start_idx = 0
     for i, l in enumerate(lines):
         if l.startswith("Line") and "Assigned" in l:
@@ -96,7 +123,7 @@ def _parse_rows_from_text(text: str) -> pd.DataFrame:
         if l.startswith("Subtotals") or l.startswith("Grand Total"):
             break
 
-        # ALL CAPS section header line: "2 PILLARS, ROCKER & FLOOR"
+        # ALL CAPS section header line
         m_header = re.match(r"^(\d+)\s+([A-Z0-9 ,&'/.-]+)$", l)
         if m_header and ("Repair" not in l) and ("Remove" not in l):
             rows.append(
@@ -110,8 +137,7 @@ def _parse_rows_from_text(text: str) -> pd.DataFrame:
             )
             continue
 
-        # Typical row pattern:
-        # line, operation, qty, part_number, rest...
+        # Typical row:
         m = re.match(r"^(\d+)\s+([A-Za-z ]+(?:/ [A-Za-z]+)?)\s+(\d+)\s+([A-Z0-9]+)\s+(.*)$", l)
         if not m:
             continue
@@ -121,14 +147,13 @@ def _parse_rows_from_text(text: str) -> pd.DataFrame:
         qty = int(m.group(3))
         rest = m.group(5)
 
-        # Hours at the end
+        # Hours at end
         mh = re.search(r"(\d+\.\d+)\s*$", rest)
         hours = float(mh.group(1)) if mh else ""
 
         rest2 = rest[: mh.start()].strip() if mh else rest
 
-        # Strip trailing labor/part tokens commonly seen:
-        # labor often includes "Body"; part may include "OEM"
+        # Strip common trailing tokens
         if " Body " in f" {rest2} ":
             rest2 = rest2.split(" Body ")[0].strip()
         rest2 = re.sub(r"\bOEM\b\s*$", "", rest2).strip()
@@ -149,21 +174,20 @@ def _parse_rows_from_text(text: str) -> pd.DataFrame:
     return df
 
 
-def extract_rows_and_translate(pdf_path: str) -> pd.DataFrame:
+def extract_workorder_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[List[str], pd.DataFrame]:
     """
-    Path-based variant (kept for convenience).
-    """
-    with pdfplumber.open(pdf_path) as pdf:
-        text = "\n".join((p.extract_text() or "") for p in pdf.pages)
-    return _parse_rows_from_text(text)
-
-
-def extract_rows_and_translate_bytes(pdf_bytes: bytes) -> pd.DataFrame:
-    """
-    Bytes-based variant (used by FastAPI upload endpoint).
-    Avoids temp files and fixes FileResponse temp-path issues.
+    Returns:
+      - header_lines: top-of-PDF details (RO#, owner, vehicle, etc.)
+      - df: parsed line items with translations
     """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        text = "\n".join((p.extract_text() or "") for p in pdf.pages)
-    return _parse_rows_from_text(text)
+        # MVP assumes first page has the header + table (common for many work orders).
+        page0 = pdf.pages[0]
+        page_text = page0.extract_text() or ""
 
+        # If multi-page, we still parse table rows across all pages (helps future-proofing).
+        full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+
+    header_lines = _extract_header_lines(page_text)
+    df = _parse_rows_from_text(full_text)
+    return header_lines, df
