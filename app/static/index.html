@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Body Shop Work Order Translator</title>
+    <style>
+      body { font-family: Arial, sans-serif; max-width: 820px; margin: 40px auto; padding: 0 16px; }
+      .card { border: 1px solid #ddd; border-radius: 12px; padding: 20px; }
+      button { padding: 10px 14px; border-radius: 10px; border: 0; cursor: pointer; }
+      input { margin: 12px 0; }
+      .small { color: #555; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <h1>Work Order Translator</h1>
+    <div class="card">
+      <p class="small">Upload a work order PDF. You’ll get back a translated PDF with a line-by-line table.</p>
+      <input id="file" type="file" accept="application/pdf" />
+      <br/>
+      <button onclick="upload()">Translate → Download PDF</button>
+      <p id="status" class="small"></p>
+    </div>
+
+    <script>
+      async function upload() {
+        const f = document.getElementById("file").files[0];
+        const status = document.getElementById("status");
+        if (!f) { status.textContent = "Please choose a PDF."; return; }
+
+        status.textContent = "Uploading and translating...";
+        const form = new FormData();
+        form.append("file", f);
+
+        const res = await fetch("/translate", { method: "POST", body: form });
+        if (!res.ok) {
+          const txt = await res.text();
+          status.textContent = "Error: " + txt;
+          return;
+        }
+
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "translated_work_order.pdf";
+        a.click();
+        window.URL.revokeObjectURL(url);
+        status.textContent = "Done.";
+      }
+    </script>
+  </body>
+</html>
+
