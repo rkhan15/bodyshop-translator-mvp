@@ -101,4 +101,75 @@ def _extract_header_kv(page_text: str) -> Dict[str, str]:
             "Year": r"Year:\s*(\d{4})",
             "Make": r"Make:\s*([A-Za-z]+)",
             "Model": r"Model:\s*(.+)",
-            "Exterior Color": r"Exterior Color
+            "Exterior Color": r"Exterior Color:\s*(.+)",
+            "Mileage In": r"Mileage In:\s*(\d+)",
+            "Vehicle In": r"Vehicle In:\s*(.+)",
+            "Vehicle Out": r"Vehi?cle Out:\s*(.+)",
+            "Estimator": r"Estimator:\s*(.+)",
+            "Insurance": r"Insurance:\s*(.+)",
+            "VIN": r"VIN:\s*([A-Z0-9]+)",
+            "Body Style": r"Body Style:\s*(.+)",
+        }
+
+        for key, pat in patterns.items():
+            m = re.search(pat, l)
+            if m and key not in header:
+                header[key] = m.group(1)
+
+    return header
+
+
+# ----------------------------
+# Table parsing
+# ----------------------------
+def _parse_rows(full_text: str) -> pd.DataFrame:
+    rows = []
+    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+
+    start_idx = 0
+    for i, l in enumerate(lines):
+        if l.startswith("Line") and "Assigned" in l:
+            start_idx = i + 1
+            break
+
+    for l in lines[start_idx:]:
+        if l.startswith("Subtotals") or l.startswith("Grand Total"):
+            break
+
+        m_header = re.match(r"^(\d+)\s+([A-Z0-9 ,&'/.-]+)$", l)
+        if m_header and ("Repair" not in l) and ("Remove" not in l):
+            rows.append(
+                {"Line": int(m_header.group(1)), "Qty": "", "Operation": "", "Description": m_header.group(2), "Hours": ""}
+            )
+            continue
+
+        m = re.match(r"^(\d+)\s+([A-Za-z ]+(?:/ [A-Za-z]+)?)\s+(\d+)\s+[A-Z0-9]+\s+(.*)$", l)
+        if not m:
+            continue
+
+        line_no, op, qty, rest = int(m.group(1)), m.group(2), int(m.group(3)), m.group(4)
+
+        mh = re.search(r"(\d+\.\d+)\s*$", rest)
+        hours = float(mh.group(1)) if mh else ""
+        desc = rest[: mh.start()].strip() if mh else rest
+        desc = desc.split(" Body ")[0].replace(" OEM", "").strip()
+
+        rows.append(
+            {"Line": line_no, "Qty": qty, "Operation": op, "Description": desc, "Hours": hours}
+        )
+
+    df = pd.DataFrame(rows).sort_values("Line").reset_index(drop=True)
+    df["Plain English"] = [_plain_english(o, d) for o, d in zip(df["Operation"], df["Description"])]
+    df["Spanish"] = [_spanish(o, d) for o, d in zip(df["Operation"], df["Description"])]
+    return df
+
+
+def extract_workorder_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[Dict[str, str], pd.DataFrame]:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        page0 = pdf.pages[0]
+        page_text = page0.extract_text() or ""
+        full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+
+    header_kv = _extract_header_kv(page_text)
+    df = _parse_rows(full_text)
+    return header_kv, df
