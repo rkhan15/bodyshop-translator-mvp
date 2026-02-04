@@ -88,37 +88,63 @@ def _is_bold_word(w: Dict[str, Any]) -> bool:
 
 
 def _clean_key(k: str) -> str:
-    return re.sub(r"\s+", " ", (k or "")).strip().rstrip(":")
+    return re.sub(r"\s+", " ", (k or "")).strip().rstrip(":").strip()
 
 
-def _words_in_bbox(page0, bbox) -> List[Dict[str, Any]]:
+def _words_in_bbox(page0, bbox, pad: float = 2.0) -> List[Dict[str, Any]]:
     """
     bbox = (x0, top, x1, bottom)
+    We expand it slightly to avoid missing text that sits near borders.
     """
     x0, top, x1, bottom = bbox
-    words = page0.within_bbox((x0, top, x1, bottom)).extract_words(
+    x0p = max(0, x0 - pad)
+    topp = max(0, top - pad)
+    x1p = x1 + pad
+    botp = bottom + pad
+
+    crop = page0.within_bbox((x0p, topp, x1p, botp))
+    words = crop.extract_words(
         extra_attrs=["fontname", "size"],
         use_text_flow=True,
         keep_blank_chars=False,
     )
-    # reading order
     return sorted(words, key=lambda w: (w["top"], w["x0"]))
 
 
-def _extract_inline_pairs_from_cell(words: List[Dict[str, Any]]) -> Tuple[str, Dict[str, str]]:
+def _group_words_into_lines(words: List[Dict[str, Any]], y_tol: float = 2.0) -> List[List[Dict[str, Any]]]:
+    if not words:
+        return []
+    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    cur_top = None
+    for w in words:
+        if cur_top is None or abs(w["top"] - cur_top) <= y_tol:
+            cur.append(w)
+            cur_top = w["top"] if cur_top is None else cur_top
+        else:
+            lines.append(sorted(cur, key=lambda ww: ww["x0"]))
+            cur = [w]
+            cur_top = w["top"]
+    if cur:
+        lines.append(sorted(cur, key=lambda ww: ww["x0"]))
+    return lines
+
+
+def _extract_inline_pairs_from_tokens(tokens: List[tuple]) -> Tuple[str, Dict[str, str]]:
     """
-    Given words from a value cell, return:
-      - main_value: bold text up to the first detected inline key (e.g., "EDSON, TERRY")
-      - extras: inline key/value pairs where key is non-bold ending in ':' and value is bold
-               e.g., {"Year": "2020", "Exterior Color": "SILVER"}
+    tokens: List[(text, is_bold)]
+    Returns:
+      - main_value: bold tokens until first inline key (or non-bold key pattern)
+      - extras: inline key/value pairs on same line/cell
+    Rules:
+      - inline key: non-bold phrase that ends with ':'
+      - inline value: preferably bold tokens immediately after key
+      - if bold is not available, fall back to non-bold tokens until next key
     """
-    # Build a token stream preserving bold flags
-    tokens = [(w["text"].strip(), _is_bold_word(w)) for w in words if w.get("text", "").strip()]
     if not tokens:
         return "", {}
 
-    # Detect inline keys that look like "Year:" "Exterior" "Color:" (multi-word keys)
-    # We'll accumulate non-bold tokens until one ends with ":" => that becomes the key.
     main_value_parts: List[str] = []
     extras: Dict[str, str] = {}
 
@@ -127,10 +153,12 @@ def _extract_inline_pairs_from_cell(words: List[Dict[str, Any]]) -> Tuple[str, D
 
     while i < len(tokens):
         text, bold = tokens[i]
+        if not text:
+            i += 1
+            continue
 
-        # Identify a key: sequence of non-bold tokens ending with ":"
+        # detect key phrase ending with ':'
         if (not bold):
-            # try to build a key phrase ending with ':'
             key_parts = []
             j = i
             found_key = False
@@ -145,20 +173,30 @@ def _extract_inline_pairs_from_cell(words: List[Dict[str, Any]]) -> Tuple[str, D
                 j += 1
 
             if found_key:
-                # Switch from main value (if we were in it)
                 in_main = False
                 key = _clean_key(" ".join(key_parts))
 
-                # Now consume bold value tokens after this key
+                # collect value tokens after key
                 k = j + 1
-                val_parts = []
-                while k < len(tokens):
-                    t2, b2 = tokens[k]
-                    if not b2:
-                        # stop when next non-bold token (likely next key)
-                        break
-                    val_parts.append(t2)
+                val_parts: List[str] = []
+
+                # Prefer bold
+                while k < len(tokens) and tokens[k][1]:
+                    val_parts.append(tokens[k][0])
                     k += 1
+
+                # If no bold value, fallback to non-bold tokens until next key
+                if not val_parts:
+                    while k < len(tokens):
+                        t2, b2 = tokens[k]
+                        if (not b2) and t2.endswith(":"):
+                            break
+                        if b2:
+                            # if bold appears later, treat it as value too
+                            val_parts.append(t2)
+                        else:
+                            val_parts.append(t2)
+                        k += 1
 
                 val = " ".join(val_parts).strip()
                 if key and val:
@@ -167,123 +205,247 @@ def _extract_inline_pairs_from_cell(words: List[Dict[str, Any]]) -> Tuple[str, D
                 i = k
                 continue
 
-        # If we're still in main section, collect bold tokens only
-        if in_main and bold:
-            main_value_parts.append(text)
+        # main value rule:
+        # - if bold exists, collect bold tokens
+        # - if no bold exists at all, collect tokens until first inline key
+        if in_main:
+            if bold:
+                main_value_parts.append(text)
+            else:
+                # only collect non-bold main value if we never see bold anywhere
+                # handled below after loop
+                pass
 
         i += 1
 
     main_value = " ".join(main_value_parts).strip()
+
+    # If main_value ended empty (e.g., no bold fonts), fallback to tokens until first key
+    if not main_value:
+        fallback_parts = []
+        for t, b in tokens:
+            if (not b) and t.endswith(":"):
+                break
+            # ignore obvious label-like bits
+            fallback_parts.append(t)
+        main_value = " ".join(fallback_parts).strip()
+
     return main_value, extras
 
 
+# ----------------------------
+# Header extraction strategies
+# ----------------------------
 def _header_table_from_page(page0) -> Optional[Any]:
-    """
-    Find the header "top box" table on the first page using line strategies.
-    Returns the pdfplumber Table object if found.
-    """
     settings = {
         "vertical_strategy": "lines",
         "horizontal_strategy": "lines",
-        "intersection_tolerance": 5,
-        "snap_tolerance": 3,
-        "join_tolerance": 3,
-        "edge_min_length": 10,
-        "min_words_vertical": 1,
-        "min_words_horizontal": 1,
+        "intersection_tolerance": 6,
+        "snap_tolerance": 4,
+        "join_tolerance": 4,
+        "edge_min_length": 12,
     }
-
     tables = page0.find_tables(settings)
     if not tables:
         return None
 
-    # Prefer the table that contains "RO Number" in its extracted text
+    # Prefer the table that contains "RO Number" somewhere
     for t in tables:
-        data = t.extract()
-        flat = " ".join([" ".join([c or "" for c in row]) for row in data]).lower()
-        if "ro number" in flat:
-            return t
+        try:
+            data = t.extract()
+            flat = " ".join([" ".join([c or "" for c in row]) for row in data]).lower()
+            if "ro number" in flat:
+                return t
+        except Exception:
+            continue
 
-    # fallback: first table
     return tables[0]
 
 
-def _extract_header_from_top_box(page0) -> Dict[str, str]:
+def _extract_header_from_top_box_table(page0) -> Dict[str, str]:
     """
-    Extract header key/value pairs from the top box while:
-      - Keeping ONLY bold tokens as the "value" for the cell's main key
-      - Splitting inline key/value pairs inside the same value cell (unbold key + bold value)
+    Best attempt: parse header from detected table cells, with bbox padding.
     """
     header: Dict[str, str] = {}
-
     t = _header_table_from_page(page0)
     if t is None:
         return header
 
-    # Table cells in reading order; each cell has bbox
-    # We expect a 7x4 grid (Label, Value, Label, Value), but templates vary slightly.
-    # We'll just read each row's 4 cells if available.
-    cells = t.cells
-    # Group cells by row using their top coordinate
-    cells_sorted = sorted(cells, key=lambda c: (c[1], c[0]))  # (x0, top) but c is (x0, top, x1, bottom)
-
-    # Build rows by y coordinate clustering
+    # t.cells are bboxes; cluster into rows by 'top'
+    cells = sorted(t.cells, key=lambda b: (b[1], b[0]))
     rows: List[List[tuple]] = []
-    y_tol = 3.0
-    current_row = []
-    current_top = None
-    for bbox in cells_sorted:
+    y_tol = 4.0
+    cur: List[tuple] = []
+    cur_top = None
+    for bbox in cells:
         top = bbox[1]
-        if current_top is None or abs(top - current_top) <= y_tol:
-            current_row.append(bbox)
-            current_top = top if current_top is None else current_top
+        if cur_top is None or abs(top - cur_top) <= y_tol:
+            cur.append(bbox)
+            cur_top = top if cur_top is None else cur_top
         else:
-            rows.append(sorted(current_row, key=lambda b: b[0]))
-            current_row = [bbox]
-            current_top = top
-    if current_row:
-        rows.append(sorted(current_row, key=lambda b: b[0]))
+            rows.append(sorted(cur, key=lambda bb: bb[0]))
+            cur = [bbox]
+            cur_top = top
+    if cur:
+        rows.append(sorted(cur, key=lambda bb: bb[0]))
 
-    # For each row, we try to map 4 cells: (k1, v1, k2, v2)
+    # Map each row to (k1,v1,k2,v2) if possible
     for row_bboxes in rows:
         if len(row_bboxes) < 2:
             continue
 
-        # Extract texts from each cell bbox
-        cell_texts = []
-        cell_words = []
-        for bbox in row_bboxes[:4]:
-            w = _words_in_bbox(page0, bbox)
-            cell_words.append(w)
-            cell_texts.append(" ".join([ww["text"] for ww in w]).strip())
+        # Label 1
+        w_k1 = _words_in_bbox(page0, row_bboxes[0], pad=3.5)
+        k1 = _clean_key(" ".join([w["text"] for w in w_k1]))
+        # Value 1
+        v1 = ""
+        extras1: Dict[str, str] = {}
+        if len(row_bboxes) >= 2:
+            w_v1 = _words_in_bbox(page0, row_bboxes[1], pad=3.5)
+            tokens = [(w["text"], _is_bold_word(w)) for w in w_v1 if w.get("text", "").strip()]
+            v1, extras1 = _extract_inline_pairs_from_tokens(tokens)
 
-        # Basic mapping:
-        # cell 0 label -> cell 1 value
-        if len(cell_texts) >= 2:
-            k1 = _clean_key(cell_texts[0])
-            if k1:
-                main_val, extras = _extract_inline_pairs_from_cell(cell_words[1])
-                if main_val:
-                    header[k1] = main_val
-                # also capture extras found inside that value cell
-                for ek, ev in extras.items():
-                    header[ek] = ev
+        if k1 and v1:
+            header[k1] = v1
+        for ek, ev in extras1.items():
+            header[ek] = ev
 
-        # cell 2 label -> cell 3 value (if present)
-        if len(cell_texts) >= 4:
-            k2 = _clean_key(cell_texts[2])
-            if k2:
-                main_val, extras = _extract_inline_pairs_from_cell(cell_words[3])
-                if main_val:
-                    header[k2] = main_val
-                for ek, ev in extras.items():
-                    header[ek] = ev
+        # Label 2 / Value 2 (if present)
+        if len(row_bboxes) >= 4:
+            w_k2 = _words_in_bbox(page0, row_bboxes[2], pad=3.5)
+            k2 = _clean_key(" ".join([w["text"] for w in w_k2]))
+
+            w_v2 = _words_in_bbox(page0, row_bboxes[3], pad=3.5)
+            tokens2 = [(w["text"], _is_bold_word(w)) for w in w_v2 if w.get("text", "").strip()]
+            v2, extras2 = _extract_inline_pairs_from_tokens(tokens2)
+
+            if k2 and v2:
+                header[k2] = v2
+            for ek, ev in extras2.items():
+                header[ek] = ev
 
     return header
 
 
+def _extract_header_from_bold_lines(page0) -> Dict[str, str]:
+    """
+    Fallback: parse using lines of words and bold/non-bold transitions.
+    """
+    words = page0.extract_words(
+        extra_attrs=["fontname", "size"],
+        use_text_flow=True,
+        keep_blank_chars=False,
+    )
+    if not words:
+        return {}
+
+    # stop at table header if present
+    header_bottom = None
+    for w in words:
+        if w.get("text") == "Line":
+            header_bottom = w["top"]
+            break
+    if header_bottom is None:
+        header_bottom = 220
+
+    words = [w for w in words if w["top"] < header_bottom]
+    lines = _group_words_into_lines(words)
+
+    header: Dict[str, str] = {}
+    for line in lines:
+        tokens = [(w["text"].strip(), _is_bold_word(w)) for w in line if w.get("text", "").strip()]
+        if not tokens:
+            continue
+
+        # Parse potentially multiple key/values in one line by "Key:" markers
+        i = 0
+        while i < len(tokens):
+            # find next key end ":"
+            if (not tokens[i][1]) and tokens[i][0].endswith(":"):
+                key = _clean_key(tokens[i][0])
+                # value = bold run after key
+                j = i + 1
+                val_parts = []
+                while j < len(tokens) and tokens[j][1]:
+                    val_parts.append(tokens[j][0])
+                    j += 1
+                if not val_parts:
+                    # fallback: collect non-bold until next key
+                    while j < len(tokens):
+                        if (not tokens[j][1]) and tokens[j][0].endswith(":"):
+                            break
+                        val_parts.append(tokens[j][0])
+                        j += 1
+
+                val = " ".join(val_parts).strip()
+                if key and val and key not in header:
+                    header[key] = val
+
+                i = j
+            else:
+                i += 1
+
+    return header
+
+
+def _extract_header_regex(page_text: str) -> Dict[str, str]:
+    """
+    Last-resort fallback.
+    """
+    def grab(pat):
+        m = re.search(pat, page_text)
+        return m.group(1).strip() if m else ""
+
+    return {
+        "RO Number": grab(r"RO Number:\s*(\d+)"),
+        "Owner": grab(r"Owner:\s*([A-Z ,]+)"),
+        "Year": grab(r"Year:\s*(\d{4})"),
+        "Exterior Color": grab(r"Exterior Color:\s*([A-Z]+)"),
+        "Make": grab(r"Make:\s*([A-Z]+)"),
+        "Vehicle In": grab(r"Vehicle In:\s*([\d/]+)"),
+        "Vehicle Out": grab(r"Vehicle Out:\s*([\d/]+)"),
+        "Model": grab(r"Model:\s*(.+?)(?:Vehicle Out:|$)"),
+        "Mileage In": grab(r"Mileage In:\s*(\d+)"),
+        "Estimator": grab(r"Estimator:\s*(.+?)(?:Insurance:|$)"),
+        "Body Style": grab(r"Body Style:\s*(.+?)(?:VIN:|$)"),
+        "Insurance": grab(r"Insurance:\s*(.+)"),
+        "VIN": grab(r"VIN:\s*([A-Z0-9]+)"),
+        "Job Number": grab(r"Job Number:\s*(.+)"),
+    }
+
+
+def _normalize_header_keys(header: Dict[str, str]) -> Dict[str, str]:
+    """
+    Map common variants into the keys your renderer expects.
+    """
+    out = dict(header)
+
+    # Common key variants
+    mapping = {
+        "RO#": "RO Number",
+        "RO": "RO Number",
+        "Exterior": "Exterior Color",
+        "ExteriorColor": "Exterior Color",
+        "JobNumber": "Job Number",
+        "VehicleIn": "Vehicle In",
+        "VehicleOut": "Vehicle Out",
+        "Mileage": "Mileage In",
+    }
+
+    for k, v in list(out.items()):
+        kk = _clean_key(k)
+        if kk in mapping:
+            out[mapping[kk]] = v
+            del out[k]
+        elif kk != k:
+            out[kk] = v
+            del out[k]
+
+    return out
+
+
 # ----------------------------
-# Line item table parsing
+# Line item parsing
 # ----------------------------
 def _parse_rows(full_text: str) -> pd.DataFrame:
     rows = []
@@ -299,6 +461,7 @@ def _parse_rows(full_text: str) -> pd.DataFrame:
         if l.startswith("Subtotals") or l.startswith("Grand Total"):
             break
 
+        # ALL CAPS section heading
         m_header = re.match(r"^(\d+)\s+([A-Z0-9 ,&'/.-]+)$", l)
         if m_header and ("Repair" not in l) and ("Remove" not in l):
             rows.append({"Line": int(m_header.group(1)), "Qty": "", "Operation": "", "Description": m_header.group(2), "Hours": ""})
@@ -329,8 +492,21 @@ def _parse_rows(full_text: str) -> pd.DataFrame:
 def extract_workorder_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[Dict[str, str], pd.DataFrame]:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page0 = pdf.pages[0]
+        page_text = page0.extract_text() or ""
         full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
 
-    header = _extract_header_from_top_box(page0)
+    # Strategy 1: table-based (with bbox padding + bold fallback)
+    header = _extract_header_from_top_box_table(page0)
+
+    # Strategy 2: bold-line parsing fallback
+    if not header:
+        header = _extract_header_from_bold_lines(page0)
+
+    # Strategy 3: regex fallback
+    if not header:
+        header = _extract_header_regex(page_text)
+
+    header = _normalize_header_keys(header)
+
     df = _parse_rows(full_text)
     return header, df
