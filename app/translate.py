@@ -1,6 +1,6 @@
 import io
 import re
-from typing import Dict, Tuple, List, Any
+from typing import Dict, Tuple, List, Any, Optional
 
 import pandas as pd
 import pdfplumber
@@ -80,162 +80,210 @@ def _spanish(op: str, desc: str) -> str:
 
 
 # ----------------------------
-# Header parsing (bold-aware)
+# Font/style helpers
 # ----------------------------
 def _is_bold_word(w: Dict[str, Any]) -> bool:
-    """
-    pdfplumber returns fontname; bold faces typically include 'Bold' in font name.
-    This is not perfect for every PDF, but works well for most estimate templates.
-    """
     fontname = (w.get("fontname") or "").lower()
-    return "bold" in fontname or "demi" in fontname or "black" in fontname
+    return ("bold" in fontname) or ("demi" in fontname) or ("black" in fontname)
 
 
-def _group_words_into_lines(words: List[Dict[str, Any]], y_tol: float = 2.0) -> List[List[Dict[str, Any]]]:
+def _clean_key(k: str) -> str:
+    return re.sub(r"\s+", " ", (k or "")).strip().rstrip(":")
+
+
+def _words_in_bbox(page0, bbox) -> List[Dict[str, Any]]:
     """
-    Group words into lines by their 'top' coordinate.
+    bbox = (x0, top, x1, bottom)
     """
-    if not words:
-        return []
-
-    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
-    lines: List[List[Dict[str, Any]]] = []
-    current: List[Dict[str, Any]] = []
-    current_top = None
-
-    for w in words:
-        if current_top is None:
-            current_top = w["top"]
-            current = [w]
-            continue
-        if abs(w["top"] - current_top) <= y_tol:
-            current.append(w)
-        else:
-            lines.append(sorted(current, key=lambda ww: ww["x0"]))
-            current_top = w["top"]
-            current = [w]
-
-    if current:
-        lines.append(sorted(current, key=lambda ww: ww["x0"]))
-
-    return lines
-
-
-def _extract_header_kv_by_bold(page0: pdfplumber.page.Page) -> Dict[str, str]:
-    """
-    Extract header key/value pairs using font boldness:
-      - Key text is NOT bold, typically ends with ':'
-      - Value text is bold, continues until next non-bold key ending ':'
-
-    Also supports multiple key/value pairs on the same line.
-    """
-    # Grab words with font info
-    words = page0.extract_words(
+    x0, top, x1, bottom = bbox
+    words = page0.within_bbox((x0, top, x1, bottom)).extract_words(
         extra_attrs=["fontname", "size"],
         use_text_flow=True,
         keep_blank_chars=False,
     )
+    # reading order
+    return sorted(words, key=lambda w: (w["top"], w["x0"]))
 
-    # Limit to header area (everything above the table header row).
-    # We detect the Y position of the 'Line Assigned' header if available.
-    header_bottom = None
-    for w in words:
-        if w["text"] == "Line":
-            header_bottom = w["top"]
-            break
-    # If we didn't find it, just use a reasonable cutoff near the top
-    if header_bottom is None:
-        header_bottom = 220
 
-    header_words = [w for w in words if w["top"] < header_bottom]
-    lines = _group_words_into_lines(header_words)
+def _extract_inline_pairs_from_cell(words: List[Dict[str, Any]]) -> Tuple[str, Dict[str, str]]:
+    """
+    Given words from a value cell, return:
+      - main_value: bold text up to the first detected inline key (e.g., "EDSON, TERRY")
+      - extras: inline key/value pairs where key is non-bold ending in ':' and value is bold
+               e.g., {"Year": "2020", "Exterior Color": "SILVER"}
+    """
+    # Build a token stream preserving bold flags
+    tokens = [(w["text"].strip(), _is_bold_word(w)) for w in words if w.get("text", "").strip()]
+    if not tokens:
+        return "", {}
 
+    # Detect inline keys that look like "Year:" "Exterior" "Color:" (multi-word keys)
+    # We'll accumulate non-bold tokens until one ends with ":" => that becomes the key.
+    main_value_parts: List[str] = []
+    extras: Dict[str, str] = {}
+
+    i = 0
+    in_main = True
+
+    while i < len(tokens):
+        text, bold = tokens[i]
+
+        # Identify a key: sequence of non-bold tokens ending with ":"
+        if (not bold):
+            # try to build a key phrase ending with ':'
+            key_parts = []
+            j = i
+            found_key = False
+            while j < len(tokens):
+                t, b = tokens[j]
+                if b:
+                    break
+                key_parts.append(t)
+                if t.endswith(":"):
+                    found_key = True
+                    break
+                j += 1
+
+            if found_key:
+                # Switch from main value (if we were in it)
+                in_main = False
+                key = _clean_key(" ".join(key_parts))
+
+                # Now consume bold value tokens after this key
+                k = j + 1
+                val_parts = []
+                while k < len(tokens):
+                    t2, b2 = tokens[k]
+                    if not b2:
+                        # stop when next non-bold token (likely next key)
+                        break
+                    val_parts.append(t2)
+                    k += 1
+
+                val = " ".join(val_parts).strip()
+                if key and val:
+                    extras[key] = val
+
+                i = k
+                continue
+
+        # If we're still in main section, collect bold tokens only
+        if in_main and bold:
+            main_value_parts.append(text)
+
+        i += 1
+
+    main_value = " ".join(main_value_parts).strip()
+    return main_value, extras
+
+
+def _header_table_from_page(page0) -> Optional[Any]:
+    """
+    Find the header "top box" table on the first page using line strategies.
+    Returns the pdfplumber Table object if found.
+    """
+    settings = {
+        "vertical_strategy": "lines",
+        "horizontal_strategy": "lines",
+        "intersection_tolerance": 5,
+        "snap_tolerance": 3,
+        "join_tolerance": 3,
+        "edge_min_length": 10,
+        "min_words_vertical": 1,
+        "min_words_horizontal": 1,
+    }
+
+    tables = page0.find_tables(settings)
+    if not tables:
+        return None
+
+    # Prefer the table that contains "RO Number" in its extracted text
+    for t in tables:
+        data = t.extract()
+        flat = " ".join([" ".join([c or "" for c in row]) for row in data]).lower()
+        if "ro number" in flat:
+            return t
+
+    # fallback: first table
+    return tables[0]
+
+
+def _extract_header_from_top_box(page0) -> Dict[str, str]:
+    """
+    Extract header key/value pairs from the top box while:
+      - Keeping ONLY bold tokens as the "value" for the cell's main key
+      - Splitting inline key/value pairs inside the same value cell (unbold key + bold value)
+    """
     header: Dict[str, str] = {}
 
-    for line in lines:
-        # Walk left-to-right and segment into key/value pairs
-        current_key_parts: List[str] = []
-        current_val_parts: List[str] = []
-        in_value = False
+    t = _header_table_from_page(page0)
+    if t is None:
+        return header
 
-        def flush():
-            nonlocal current_key_parts, current_val_parts, in_value
-            if current_key_parts:
-                key = " ".join(current_key_parts).strip().rstrip(":")
-                val = " ".join(current_val_parts).strip()
-                if key and val and key not in header:
-                    header[key] = val
-            current_key_parts = []
-            current_val_parts = []
-            in_value = False
+    # Table cells in reading order; each cell has bbox
+    # We expect a 7x4 grid (Label, Value, Label, Value), but templates vary slightly.
+    # We'll just read each row's 4 cells if available.
+    cells = t.cells
+    # Group cells by row using their top coordinate
+    cells_sorted = sorted(cells, key=lambda c: (c[1], c[0]))  # (x0, top) but c is (x0, top, x1, bottom)
 
-        for w in line:
-            text = w["text"].strip()
-            if not text:
-                continue
+    # Build rows by y coordinate clustering
+    rows: List[List[tuple]] = []
+    y_tol = 3.0
+    current_row = []
+    current_top = None
+    for bbox in cells_sorted:
+        top = bbox[1]
+        if current_top is None or abs(top - current_top) <= y_tol:
+            current_row.append(bbox)
+            current_top = top if current_top is None else current_top
+        else:
+            rows.append(sorted(current_row, key=lambda b: b[0]))
+            current_row = [bbox]
+            current_top = top
+    if current_row:
+        rows.append(sorted(current_row, key=lambda b: b[0]))
 
-            bold = _is_bold_word(w)
+    # For each row, we try to map 4 cells: (k1, v1, k2, v2)
+    for row_bboxes in rows:
+        if len(row_bboxes) < 2:
+            continue
 
-            # A new key usually appears as non-bold text that ends with ':'
-            if (not bold) and text.endswith(":"):
-                # flush previous pair if any
-                flush()
-                current_key_parts = [text.rstrip(":")]
-                in_value = True  # value expected next
-                continue
+        # Extract texts from each cell bbox
+        cell_texts = []
+        cell_words = []
+        for bbox in row_bboxes[:4]:
+            w = _words_in_bbox(page0, bbox)
+            cell_words.append(w)
+            cell_texts.append(" ".join([ww["text"] for ww in w]).strip())
 
-            # Sometimes keys are multiple words before ':' (e.g., "Exterior Color:")
-            # We handle that by accumulating non-bold key parts until we see a token ending with ':'
-            if (not bold) and (not in_value):
-                current_key_parts.append(text)
-                continue
+        # Basic mapping:
+        # cell 0 label -> cell 1 value
+        if len(cell_texts) >= 2:
+            k1 = _clean_key(cell_texts[0])
+            if k1:
+                main_val, extras = _extract_inline_pairs_from_cell(cell_words[1])
+                if main_val:
+                    header[k1] = main_val
+                # also capture extras found inside that value cell
+                for ek, ev in extras.items():
+                    header[ek] = ev
 
-            # Value tokens are bold (your requirement)
-            if in_value and bold:
-                current_val_parts.append(text)
-                continue
-
-            # If we are in a value and we hit a non-bold token that looks like part of the next key,
-            # we keep it in a buffer until we see a ':' token. A simpler rule:
-            # ignore non-bold tokens while in_value unless they end with ':' (handled above)
-            # This prevents "Year: 2020 Exterior Color:" from being pulled into the value.
-            if in_value and (not bold):
-                # ignore
-                continue
-
-        flush()
+        # cell 2 label -> cell 3 value (if present)
+        if len(cell_texts) >= 4:
+            k2 = _clean_key(cell_texts[2])
+            if k2:
+                main_val, extras = _extract_inline_pairs_from_cell(cell_words[3])
+                if main_val:
+                    header[k2] = main_val
+                for ek, ev in extras.items():
+                    header[ek] = ev
 
     return header
 
 
-def _extract_header_fallback_regex(page_text: str) -> Dict[str, str]:
-    """
-    Fallback for PDFs where font info isn't usable.
-    """
-    def grab(pat):
-        m = re.search(pat, page_text)
-        return m.group(1).strip() if m else ""
-
-    return {
-        "RO Number": grab(r"RO Number:\s*(\d+)"),
-        "Owner": grab(r"Owner:\s*(.+)"),
-        "Year": grab(r"Year:\s*(\d{4})"),
-        "Exterior Color": grab(r"Exterior Color:\s*(.+)"),
-        "Make": grab(r"Make:\s*(.+)"),
-        "Vehicle In": grab(r"Vehicle In:\s*(.+)"),
-        "Vehicle Out": grab(r"Vehicle Out:\s*(.+)"),
-        "Model": grab(r"Model:\s*(.+)"),
-        "Mileage In": grab(r"Mileage In:\s*(.+)"),
-        "Estimator": grab(r"Estimator:\s*(.+)"),
-        "Body Style": grab(r"Body Style:\s*(.+)"),
-        "Insurance": grab(r"Insurance:\s*(.+)"),
-        "VIN": grab(r"VIN:\s*([A-Z0-9]+)"),
-        "Job Number": grab(r"Job Number:\s*(.+)"),
-    }
-
-
 # ----------------------------
-# Table parsing
+# Line item table parsing
 # ----------------------------
 def _parse_rows(full_text: str) -> pd.DataFrame:
     rows = []
@@ -251,13 +299,11 @@ def _parse_rows(full_text: str) -> pd.DataFrame:
         if l.startswith("Subtotals") or l.startswith("Grand Total"):
             break
 
-        # ALL CAPS section header line: "2 PILLARS, ROCKER & FLOOR"
         m_header = re.match(r"^(\d+)\s+([A-Z0-9 ,&'/.-]+)$", l)
         if m_header and ("Repair" not in l) and ("Remove" not in l):
             rows.append({"Line": int(m_header.group(1)), "Qty": "", "Operation": "", "Description": m_header.group(2), "Hours": ""})
             continue
 
-        # Typical row:
         m = re.match(r"^(\d+)\s+([A-Za-z ]+(?:/ [A-Za-z]+)?)\s+(\d+)\s+[A-Z0-9]+\s+(.*)$", l)
         if not m:
             continue
@@ -268,7 +314,6 @@ def _parse_rows(full_text: str) -> pd.DataFrame:
         hours = float(mh.group(1)) if mh else ""
         desc = rest[: mh.start()].strip() if mh else rest
 
-        # Trim trailing tokens like "Body" or "OEM"
         if " Body " in f" {desc} ":
             desc = desc.split(" Body ")[0].strip()
         desc = re.sub(r"\bOEM\b\s*$", "", desc).strip()
@@ -284,13 +329,8 @@ def _parse_rows(full_text: str) -> pd.DataFrame:
 def extract_workorder_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[Dict[str, str], pd.DataFrame]:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page0 = pdf.pages[0]
-        page_text = page0.extract_text() or ""
         full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
 
-    # Bold-aware extraction first; fallback if it returns nothing
-    header = _extract_header_kv_by_bold(page0)
-    if not header:
-        header = _extract_header_fallback_regex(page_text)
-
+    header = _extract_header_from_top_box(page0)
     df = _parse_rows(full_text)
     return header, df
