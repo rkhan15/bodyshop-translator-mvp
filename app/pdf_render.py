@@ -17,10 +17,10 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> bytes:
     """
     Renders:
-    1) A fixed-grid header box matching the original work order layout
-    2) A landscape translated line-item table with wrapping text
+    1) Fixed-grid header box (Label | Value | Label | Value)
+    2) Landscape translated line-item table with wrapping text
+       - ALL-CAPS section headers rendered bold
     """
-
     buffer = io.BytesIO()
 
     doc = SimpleDocTemplate(
@@ -55,7 +55,7 @@ def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> by
     story.append(Spacer(1, 10))
 
     # ------------------------------------------------------------------
-    # HEADER BOX — FIXED GRID (MATCHES ORIGINAL BODY SHOP ESTIMATE)
+    # HEADER BOX — FIXED GRID
     # ------------------------------------------------------------------
     header_rows = [
         ["RO Number", header.get("RO Number", ""), "Owner", header.get("Owner", "")],
@@ -101,27 +101,27 @@ def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> by
     # ------------------------------------------------------------------
     # TRANSLATED LINE ITEM TABLE
     # ------------------------------------------------------------------
-    table_columns = [
-        "Line",
-        "Qty",
-        "Operation",
-        "Description",
-        "Hours",
-        "Plain English",
-        "Spanish",
-    ]
+    table_columns = ["Line", "Qty", "Operation", "Description", "Hours", "Plain English", "Spanish"]
 
-    table_data = [
-        [Paragraph(f"<b>{c}</b>", value_style) for c in table_columns]
-    ]
+    # header row
+    table_data = [[Paragraph(f"<b>{c}</b>", value_style) for c in table_columns]]
 
     for _, row in df.iterrows():
-        table_data.append(
-            [
-                Paragraph(str(row.get(col, "")), value_style)
-                for col in table_columns
-            ]
-        )
+        op = str(row.get("Operation", "") or "")
+        desc = str(row.get("Description", "") or "")
+
+        is_section_header = (op.strip() == "") and desc.isupper()
+
+        rendered_cells = []
+        for col in table_columns:
+            val = str(row.get(col, "") or "")
+
+            if is_section_header and col == "Description":
+                rendered_cells.append(Paragraph(f"<b>{val}</b>", value_style))
+            else:
+                rendered_cells.append(Paragraph(val, value_style))
+
+        table_data.append(rendered_cells)
 
     line_item_table = Table(
         table_data,
@@ -145,6 +145,5 @@ def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> by
     )
 
     story.append(line_item_table)
-
     doc.build(story)
     return buffer.getvalue()

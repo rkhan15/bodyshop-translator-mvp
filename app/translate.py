@@ -1,9 +1,10 @@
 import io
 import re
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Any
 
 import pandas as pd
 import pdfplumber
+
 
 SPANISH_GLOSSARY = {
     "belt molding": "moldura de la ventana",
@@ -79,44 +80,158 @@ def _spanish(op: str, desc: str) -> str:
 
 
 # ----------------------------
-# Header (top box) extraction
+# Header parsing (bold-aware)
 # ----------------------------
-def _extract_header_kv(page_text: str) -> Dict[str, str]:
+def _is_bold_word(w: Dict[str, Any]) -> bool:
     """
-    Extracts key/value pairs from the top box of the work order.
-    Output is structured so it can be rendered as a box.
+    pdfplumber returns fontname; bold faces typically include 'Bold' in font name.
+    This is not perfect for every PDF, but works well for most estimate templates.
     """
-    lines = [l.strip() for l in page_text.splitlines() if l.strip()]
+    fontname = (w.get("fontname") or "").lower()
+    return "bold" in fontname or "demi" in fontname or "black" in fontname
 
-    header = {}
 
-    for l in lines:
-        if l.startswith("Work Order") or (l.startswith("Line") and "Assigned" in l):
+def _group_words_into_lines(words: List[Dict[str, Any]], y_tol: float = 2.0) -> List[List[Dict[str, Any]]]:
+    """
+    Group words into lines by their 'top' coordinate.
+    """
+    if not words:
+        return []
+
+    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    current_top = None
+
+    for w in words:
+        if current_top is None:
+            current_top = w["top"]
+            current = [w]
+            continue
+        if abs(w["top"] - current_top) <= y_tol:
+            current.append(w)
+        else:
+            lines.append(sorted(current, key=lambda ww: ww["x0"]))
+            current_top = w["top"]
+            current = [w]
+
+    if current:
+        lines.append(sorted(current, key=lambda ww: ww["x0"]))
+
+    return lines
+
+
+def _extract_header_kv_by_bold(page0: pdfplumber.page.Page) -> Dict[str, str]:
+    """
+    Extract header key/value pairs using font boldness:
+      - Key text is NOT bold, typically ends with ':'
+      - Value text is bold, continues until next non-bold key ending ':'
+
+    Also supports multiple key/value pairs on the same line.
+    """
+    # Grab words with font info
+    words = page0.extract_words(
+        extra_attrs=["fontname", "size"],
+        use_text_flow=True,
+        keep_blank_chars=False,
+    )
+
+    # Limit to header area (everything above the table header row).
+    # We detect the Y position of the 'Line Assigned' header if available.
+    header_bottom = None
+    for w in words:
+        if w["text"] == "Line":
+            header_bottom = w["top"]
             break
+    # If we didn't find it, just use a reasonable cutoff near the top
+    if header_bottom is None:
+        header_bottom = 220
 
-        # Common patterns in body shop estimates
-        patterns = {
-            "RO Number": r"RO Number:\s*(.+)",
-            "Owner": r"Owner:\s*(.+)",
-            "Year": r"Year:\s*(\d{4})",
-            "Make": r"Make:\s*([A-Za-z]+)",
-            "Model": r"Model:\s*(.+)",
-            "Exterior Color": r"Exterior Color:\s*(.+)",
-            "Mileage In": r"Mileage In:\s*(\d+)",
-            "Vehicle In": r"Vehicle In:\s*(.+)",
-            "Vehicle Out": r"Vehi?cle Out:\s*(.+)",
-            "Estimator": r"Estimator:\s*(.+)",
-            "Insurance": r"Insurance:\s*(.+)",
-            "VIN": r"VIN:\s*([A-Z0-9]+)",
-            "Body Style": r"Body Style:\s*(.+)",
-        }
+    header_words = [w for w in words if w["top"] < header_bottom]
+    lines = _group_words_into_lines(header_words)
 
-        for key, pat in patterns.items():
-            m = re.search(pat, l)
-            if m and key not in header:
-                header[key] = m.group(1)
+    header: Dict[str, str] = {}
+
+    for line in lines:
+        # Walk left-to-right and segment into key/value pairs
+        current_key_parts: List[str] = []
+        current_val_parts: List[str] = []
+        in_value = False
+
+        def flush():
+            nonlocal current_key_parts, current_val_parts, in_value
+            if current_key_parts:
+                key = " ".join(current_key_parts).strip().rstrip(":")
+                val = " ".join(current_val_parts).strip()
+                if key and val and key not in header:
+                    header[key] = val
+            current_key_parts = []
+            current_val_parts = []
+            in_value = False
+
+        for w in line:
+            text = w["text"].strip()
+            if not text:
+                continue
+
+            bold = _is_bold_word(w)
+
+            # A new key usually appears as non-bold text that ends with ':'
+            if (not bold) and text.endswith(":"):
+                # flush previous pair if any
+                flush()
+                current_key_parts = [text.rstrip(":")]
+                in_value = True  # value expected next
+                continue
+
+            # Sometimes keys are multiple words before ':' (e.g., "Exterior Color:")
+            # We handle that by accumulating non-bold key parts until we see a token ending with ':'
+            if (not bold) and (not in_value):
+                current_key_parts.append(text)
+                continue
+
+            # Value tokens are bold (your requirement)
+            if in_value and bold:
+                current_val_parts.append(text)
+                continue
+
+            # If we are in a value and we hit a non-bold token that looks like part of the next key,
+            # we keep it in a buffer until we see a ':' token. A simpler rule:
+            # ignore non-bold tokens while in_value unless they end with ':' (handled above)
+            # This prevents "Year: 2020 Exterior Color:" from being pulled into the value.
+            if in_value and (not bold):
+                # ignore
+                continue
+
+        flush()
 
     return header
+
+
+def _extract_header_fallback_regex(page_text: str) -> Dict[str, str]:
+    """
+    Fallback for PDFs where font info isn't usable.
+    """
+    def grab(pat):
+        m = re.search(pat, page_text)
+        return m.group(1).strip() if m else ""
+
+    return {
+        "RO Number": grab(r"RO Number:\s*(\d+)"),
+        "Owner": grab(r"Owner:\s*(.+)"),
+        "Year": grab(r"Year:\s*(\d{4})"),
+        "Exterior Color": grab(r"Exterior Color:\s*(.+)"),
+        "Make": grab(r"Make:\s*(.+)"),
+        "Vehicle In": grab(r"Vehicle In:\s*(.+)"),
+        "Vehicle Out": grab(r"Vehicle Out:\s*(.+)"),
+        "Model": grab(r"Model:\s*(.+)"),
+        "Mileage In": grab(r"Mileage In:\s*(.+)"),
+        "Estimator": grab(r"Estimator:\s*(.+)"),
+        "Body Style": grab(r"Body Style:\s*(.+)"),
+        "Insurance": grab(r"Insurance:\s*(.+)"),
+        "VIN": grab(r"VIN:\s*([A-Z0-9]+)"),
+        "Job Number": grab(r"Job Number:\s*(.+)"),
+    }
 
 
 # ----------------------------
@@ -136,27 +251,29 @@ def _parse_rows(full_text: str) -> pd.DataFrame:
         if l.startswith("Subtotals") or l.startswith("Grand Total"):
             break
 
+        # ALL CAPS section header line: "2 PILLARS, ROCKER & FLOOR"
         m_header = re.match(r"^(\d+)\s+([A-Z0-9 ,&'/.-]+)$", l)
         if m_header and ("Repair" not in l) and ("Remove" not in l):
-            rows.append(
-                {"Line": int(m_header.group(1)), "Qty": "", "Operation": "", "Description": m_header.group(2), "Hours": ""}
-            )
+            rows.append({"Line": int(m_header.group(1)), "Qty": "", "Operation": "", "Description": m_header.group(2), "Hours": ""})
             continue
 
+        # Typical row:
         m = re.match(r"^(\d+)\s+([A-Za-z ]+(?:/ [A-Za-z]+)?)\s+(\d+)\s+[A-Z0-9]+\s+(.*)$", l)
         if not m:
             continue
 
-        line_no, op, qty, rest = int(m.group(1)), m.group(2), int(m.group(3)), m.group(4)
+        line_no, op, qty, rest = int(m.group(1)), m.group(2).strip(), int(m.group(3)), m.group(4)
 
         mh = re.search(r"(\d+\.\d+)\s*$", rest)
         hours = float(mh.group(1)) if mh else ""
         desc = rest[: mh.start()].strip() if mh else rest
-        desc = desc.split(" Body ")[0].replace(" OEM", "").strip()
 
-        rows.append(
-            {"Line": line_no, "Qty": qty, "Operation": op, "Description": desc, "Hours": hours}
-        )
+        # Trim trailing tokens like "Body" or "OEM"
+        if " Body " in f" {desc} ":
+            desc = desc.split(" Body ")[0].strip()
+        desc = re.sub(r"\bOEM\b\s*$", "", desc).strip()
+
+        rows.append({"Line": line_no, "Qty": qty, "Operation": op, "Description": desc, "Hours": hours})
 
     df = pd.DataFrame(rows).sort_values("Line").reset_index(drop=True)
     df["Plain English"] = [_plain_english(o, d) for o, d in zip(df["Operation"], df["Description"])]
@@ -164,33 +281,16 @@ def _parse_rows(full_text: str) -> pd.DataFrame:
     return df
 
 
-def extract_workorder_from_pdf_bytes(pdf_bytes: bytes):
+def extract_workorder_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[Dict[str, str], pd.DataFrame]:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page0 = pdf.pages[0]
-        text = page0.extract_text() or ""
+        page_text = page0.extract_text() or ""
         full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
 
-    def grab(pattern):
-        m = re.search(pattern, text)
-        return m.group(1).strip() if m else ""
-
-    header = {
-        "RO Number": grab(r"RO Number:\s*(\d+)"),
-        "Owner": grab(r"Owner:\s*([A-Z ,]+)"),
-        "Year": grab(r"Year:\s*(\d{4})"),
-        "Exterior Color": grab(r"Exterior Color:\s*([A-Z]+)"),
-        "Make": grab(r"Make:\s*([A-Z]+)"),
-        "Vehicle In": grab(r"Vehicle In:\s*([\d/]+)"),
-        "Model": grab(r"Model:\s*([A-Z0-9 ]+)"),
-        "Vehicle Out": grab(r"Vehicle Out:\s*([\d/]+)"),
-        "Mileage In": grab(r"Mileage In:\s*(\d+)"),
-        "Estimator": grab(r"Estimator:\s*([A-Za-z .]+)"),
-        "Body Style": grab(r"Body Style:\s*([A-Z0-9 ]+)"),
-        "Insurance": grab(r"Insurance:\s*([A-Z0-9 ]+)"),
-        "VIN": grab(r"VIN:\s*([A-Z0-9]+)"),
-        "Job Number": grab(r"Job Number:\s*(\S+)"),
-    }
+    # Bold-aware extraction first; fallback if it returns nothing
+    header = _extract_header_kv_by_bold(page0)
+    if not header:
+        header = _extract_header_fallback_regex(page_text)
 
     df = _parse_rows(full_text)
     return header, df
-
