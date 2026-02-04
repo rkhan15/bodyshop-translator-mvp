@@ -164,12 +164,33 @@ def _parse_rows(full_text: str) -> pd.DataFrame:
     return df
 
 
-def extract_workorder_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[Dict[str, str], pd.DataFrame]:
+def extract_workorder_from_pdf_bytes(pdf_bytes: bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page0 = pdf.pages[0]
-        page_text = page0.extract_text() or ""
+        text = page0.extract_text() or ""
         full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
 
-    header_kv = _extract_header_kv(page_text)
+    def grab(pattern):
+        m = re.search(pattern, text)
+        return m.group(1).strip() if m else ""
+
+    header = {
+        "RO Number": grab(r"RO Number:\s*(\d+)"),
+        "Owner": grab(r"Owner:\s*([A-Z ,]+)"),
+        "Year": grab(r"Year:\s*(\d{4})"),
+        "Exterior Color": grab(r"Exterior Color:\s*([A-Z]+)"),
+        "Make": grab(r"Make:\s*([A-Z]+)"),
+        "Vehicle In": grab(r"Vehicle In:\s*([\d/]+)"),
+        "Model": grab(r"Model:\s*([A-Z0-9 ]+)"),
+        "Vehicle Out": grab(r"Vehicle Out:\s*([\d/]+)"),
+        "Mileage In": grab(r"Mileage In:\s*(\d+)"),
+        "Estimator": grab(r"Estimator:\s*([A-Za-z .]+)"),
+        "Body Style": grab(r"Body Style:\s*([A-Z0-9 ]+)"),
+        "Insurance": grab(r"Insurance:\s*([A-Z0-9 ]+)"),
+        "VIN": grab(r"VIN:\s*([A-Z0-9]+)"),
+        "Job Number": grab(r"Job Number:\s*(\S+)"),
+    }
+
     df = _parse_rows(full_text)
-    return header_kv, df
+    return header, df
+

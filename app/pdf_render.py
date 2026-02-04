@@ -14,11 +14,17 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 
-def render_translation_pdf_bytes(header_kv: Dict[str, str], df: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
+def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> bytes:
+    """
+    Renders:
+    1) A fixed-grid header box matching the original work order layout
+    2) A landscape translated line-item table with wrapping text
+    """
+
+    buffer = io.BytesIO()
 
     doc = SimpleDocTemplate(
-        buf,
+        buffer,
         pagesize=landscape(letter),
         leftMargin=28,
         rightMargin=28,
@@ -27,73 +33,118 @@ def render_translation_pdf_bytes(header_kv: Dict[str, str], df: pd.DataFrame) ->
     )
 
     styles = getSampleStyleSheet()
-    cell = ParagraphStyle("cell", fontSize=8, leading=10)
-    label = ParagraphStyle("label", fontSize=8, leading=10, fontName="Helvetica-Bold")
+
+    label_style = ParagraphStyle(
+        "label",
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=10,
+    )
+
+    value_style = ParagraphStyle(
+        "value",
+        fontName="Helvetica",
+        fontSize=8,
+        leading=10,
+    )
+
+    title_style = styles["Title"]
 
     story = []
-    story.append(Paragraph("Translated Work Order (English + Spanish)", styles["Title"]))
+    story.append(Paragraph("Translated Work Order (English + Spanish)", title_style))
     story.append(Spacer(1, 10))
 
-    # -------- Header box --------
-    if header_kv:
-        header_rows = []
-        items = list(header_kv.items())
+    # ------------------------------------------------------------------
+    # HEADER BOX — FIXED GRID (MATCHES ORIGINAL BODY SHOP ESTIMATE)
+    # ------------------------------------------------------------------
+    header_rows = [
+        ["RO Number", header.get("RO Number", ""), "Owner", header.get("Owner", "")],
+        ["Year", header.get("Year", ""), "Exterior Color", header.get("Exterior Color", "")],
+        ["Make", header.get("Make", ""), "Vehicle In", header.get("Vehicle In", "")],
+        ["Model", header.get("Model", ""), "Vehicle Out", header.get("Vehicle Out", "")],
+        ["Mileage In", header.get("Mileage In", ""), "Estimator", header.get("Estimator", "")],
+        ["Body Style", header.get("Body Style", ""), "Insurance", header.get("Insurance", "")],
+        ["VIN", header.get("VIN", ""), "Job Number", header.get("Job Number", "")],
+    ]
 
-        # Two-column box: (label, value) x 2 per row
-        for i in range(0, len(items), 2):
-            left = items[i]
-            right = items[i + 1] if i + 1 < len(items) else ("", "")
-            header_rows.append(
-                [
-                    Paragraph(left[0], label),
-                    Paragraph(left[1], cell),
-                    Paragraph(right[0], label),
-                    Paragraph(right[1], cell),
-                ]
-            )
+    header_table_data = []
+    for row in header_rows:
+        rendered_row = []
+        for i, cell in enumerate(row):
+            style = label_style if i % 2 == 0 else value_style
+            rendered_row.append(Paragraph(str(cell), style))
+        header_table_data.append(rendered_row)
 
-        header_table = Table(
-            header_rows,
-            colWidths=[90, 180, 90, 180],
-            hAlign="LEFT",
+    header_table = Table(
+        header_table_data,
+        colWidths=[90, 200, 90, 220],
+        hAlign="LEFT",
+    )
+
+    header_table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
         )
-        header_table.setStyle(
-            TableStyle(
-                [
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ]
-            )
+    )
+
+    story.append(header_table)
+    story.append(Spacer(1, 16))
+
+    # ------------------------------------------------------------------
+    # TRANSLATED LINE ITEM TABLE
+    # ------------------------------------------------------------------
+    table_columns = [
+        "Line",
+        "Qty",
+        "Operation",
+        "Description",
+        "Hours",
+        "Plain English",
+        "Spanish",
+    ]
+
+    table_data = [
+        [Paragraph(f"<b>{c}</b>", value_style) for c in table_columns]
+    ]
+
+    for _, row in df.iterrows():
+        table_data.append(
+            [
+                Paragraph(str(row.get(col, "")), value_style)
+                for col in table_columns
+            ]
         )
 
-        story.append(header_table)
-        story.append(Spacer(1, 14))
-
-    # -------- Line item table --------
-    cols = ["Line", "Qty", "Operation", "Description", "Hours", "Plain English", "Spanish"]
-    data = [[Paragraph(f"<b>{c}</b>", cell) for c in cols]]
-
-    for _, r in df.iterrows():
-        data.append([Paragraph(str(r[c]), cell) for c in cols])
-
-    table = Table(
-        data,
+    line_item_table = Table(
+        table_data,
         colWidths=[38, 32, 90, 170, 46, 180, 180],
         repeatRows=1,
+        hAlign="LEFT",
     )
-    table.setStyle(
+
+    line_item_table.setStyle(
         TableStyle(
             [
                 ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                 ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
             ]
         )
     )
 
-    story.append(table)
+    story.append(line_item_table)
+
     doc.build(story)
-    return buf.getvalue()
+    return buffer.getvalue()
