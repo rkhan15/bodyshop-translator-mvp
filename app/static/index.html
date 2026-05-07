@@ -4,20 +4,74 @@
     <meta charset="utf-8" />
     <title>Body Shop Translator</title>
     <style>
-      body { font-family: Arial, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; }
-      .card { border: 1px solid #ddd; border-radius: 12px; padding: 18px; }
-      button { padding: 10px 14px; cursor: pointer; }
-      .small { color: #666; font-size: 13px; }
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 760px;
+        margin: 40px auto;
+        padding: 0 16px;
+      }
+
+      .card {
+        border: 1px solid #ddd;
+        border-radius: 12px;
+        padding: 18px;
+        margin-bottom: 20px;
+      }
+
+      button {
+        padding: 10px 14px;
+        cursor: pointer;
+      }
+
+      textarea {
+        width: 100%;
+        padding: 10px;
+        box-sizing: border-box;
+        font-family: Arial, sans-serif;
+        font-size: 14px;
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        resize: vertical;
+      }
+
+      .small {
+        color: #666;
+        font-size: 13px;
+      }
     </style>
   </head>
+
   <body>
     <h2>Body Shop Work Order Translator</h2>
+
     <div class="card">
+      <h3>Upload Work Order</h3>
+
       <form id="uploadForm">
         <input type="file" id="file" name="file" accept="application/pdf" required />
         <button type="submit">Translate</button>
       </form>
+
       <p id="status" class="small"></p>
+    </div>
+
+    <div class="card">
+      <h3>Send Feedback</h3>
+
+      <p class="small">
+        Notice an issue with the translation, formatting, missing fields, or output PDF?
+        Send feedback here.
+      </p>
+
+      <textarea
+        id="feedbackText"
+        rows="5"
+        placeholder="Describe the issue or suggestion..."
+      ></textarea>
+
+      <br /><br />
+
+      <button type="button" onclick="sendFeedback()">Send Feedback</button>
     </div>
 
     <script>
@@ -41,29 +95,62 @@
         status.textContent = "Uploading and translating…";
 
         const fileInput = document.getElementById("file");
-        const fd = new FormData();
-        fd.append("file", fileInput.files[0]);
 
-        const res = await fetch("/translate", { method: "POST", body: fd });
-
-        if (!res.ok) {
-          const txt = await res.text();
-          status.textContent = "Error: " + txt;
+        if (!fileInput.files.length) {
+          status.textContent = "Please choose a PDF file first.";
           return;
         }
 
-        const blob = await res.blob();
-        const filename = getFilenameFromDisposition(res.headers.get("Content-Disposition"));
+        const fd = new FormData();
+        fd.append("file", fileInput.files[0]);
 
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = filename;
-        a.click();
-        window.URL.revokeObjectURL(url);
+        try {
+          const res = await fetch("/translate", {
+            method: "POST",
+            body: fd,
+          });
 
-        status.textContent = "Done — download started.";
+          if (!res.ok) {
+            const txt = await res.text();
+            status.textContent = "Error: " + txt;
+            return;
+          }
+
+          const blob = await res.blob();
+          const filename = getFilenameFromDisposition(
+            res.headers.get("Content-Disposition")
+          );
+
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          a.click();
+          window.URL.revokeObjectURL(url);
+
+          status.textContent = "Done — download started.";
+        } catch (err) {
+          status.textContent = "Error: Something went wrong while translating.";
+        }
       });
+
+      function sendFeedback() {
+        const feedback = document.getElementById("feedbackText").value.trim();
+
+        if (!feedback) {
+          alert("Please enter feedback before sending.");
+          return;
+        }
+
+        const yourEmail = "raihakhan01@gmail.com";
+        const ccEmail = "admin@eemsys.com";
+
+        const subject = encodeURIComponent("Body Shop Translator Feedback");
+        const body = encodeURIComponent(feedback);
+
+        window.location.href =
+          `mailto:${yourEmail}?cc=${ccEmail}&subject=${subject}&body=${body}`;
+      }
     </script>
   </body>
 </html>
