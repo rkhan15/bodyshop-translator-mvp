@@ -2,6 +2,8 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import io
+from datetime import datetime
+import os
 
 from .translate import extract_workorder_from_pdf_bytes
 from .pdf_render import render_translation_pdf_bytes
@@ -31,10 +33,15 @@ async def translate(file: UploadFile = File(...)):
         # Render to PDF bytes
         out_pdf_bytes = render_translation_pdf_bytes(header_lines, df)
 
+        # Generate dynamic filename with timestamp and original filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        original_name = os.path.splitext(file.filename)[0]
+        output_filename = f"translated_{timestamp}_{original_name}.pdf"
+
         return StreamingResponse(
             io.BytesIO(out_pdf_bytes),
             media_type="application/pdf",
-            headers={"Content-Disposition": 'attachment; filename="translated_work_order.pdf"'},
+            headers={"Content-Disposition": f'attachment; filename="{output_filename}"'},
         )
     except Exception as e:
         return PlainTextResponse(f"Failed to process PDF: {e}", status_code=500)
