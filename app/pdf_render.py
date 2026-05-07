@@ -17,7 +17,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> bytes:
     """
     Renders:
-    1) Fixed-grid header box (Label | Value | Label | Value)
+    1) Fixed-grid header box organized into Vehicle Info and Estimator Info sections
     2) Landscape translated line-item table with wrapping text
        - ALL-CAPS section headers rendered bold
     """
@@ -55,33 +55,41 @@ def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> by
     story.append(Spacer(1, 10))
 
     # ------------------------------------------------------------------
-    # HEADER BOX — FIXED GRID
+    # HEADER BOX — ORGANIZED INTO TWO SECTIONS
     # ------------------------------------------------------------------
-    header_rows = [
-        ["RO Number", header.get("RO Number", ""), "Owner", header.get("Owner", "")],
-        ["Year", header.get("Year", ""), "Exterior Color", header.get("Exterior Color", "")],
-        ["Make", header.get("Make", ""), "Vehicle In", header.get("Vehicle In", "")],
-        ["Model", header.get("Model", ""), "Vehicle Out", header.get("Vehicle Out", "")],
-        ["Mileage In", header.get("Mileage In", ""), "Estimator", header.get("Estimator", "")],
-        ["Body Style", header.get("Body Style", ""), "Insurance", header.get("Insurance", "")],
-        ["VIN", header.get("VIN", ""), "Job Number", header.get("Job Number", "")],
+    # Vehicle Information section
+    vehicle_rows = [
+        ["RO Number", header.get("RO Number", ""), "Job Number", header.get("Job Number", "")],
+        ["Year", header.get("Year", ""), "Make", header.get("Make", "")],
+        ["Model", header.get("Model", ""), "Body Style", header.get("Body Style", "")],
+        ["VIN", header.get("VIN", ""), "Mileage In", header.get("Mileage In", "")],
+        ["Exterior Color", header.get("Exterior Color", ""), "Vehicle In", header.get("Vehicle In", "")],
+        ["Vehicle Out", header.get("Vehicle Out", ""), "", ""],
     ]
 
-    header_table_data = []
-    for row in header_rows:
+    # Estimator/Insurance Information section
+    estimator_rows = [
+        ["Owner", header.get("Owner", ""), "Estimator", header.get("Estimator", "")],
+        ["Insurance", header.get("Insurance", ""), "", ""],
+    ]
+
+    # Build vehicle info table
+    vehicle_table_data = []
+    vehicle_table_data.append([Paragraph("<b>Vehicle Information</b>", label_style), "", "", ""])
+    for row in vehicle_rows:
         rendered_row = []
         for i, cell in enumerate(row):
             style = label_style if i % 2 == 0 else value_style
             rendered_row.append(Paragraph(str(cell), style))
-        header_table_data.append(rendered_row)
+        vehicle_table_data.append(rendered_row)
 
-    header_table = Table(
-        header_table_data,
+    vehicle_table = Table(
+        vehicle_table_data,
         colWidths=[90, 200, 90, 220],
         hAlign="LEFT",
     )
 
-    header_table.setStyle(
+    vehicle_table.setStyle(
         TableStyle(
             [
                 ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
@@ -95,7 +103,40 @@ def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> by
         )
     )
 
-    story.append(header_table)
+    story.append(vehicle_table)
+    story.append(Spacer(1, 8))
+
+    # Build estimator info table
+    estimator_table_data = []
+    estimator_table_data.append([Paragraph("<b>Estimator & Insurance Information</b>", label_style), "", "", ""])
+    for row in estimator_rows:
+        rendered_row = []
+        for i, cell in enumerate(row):
+            style = label_style if i % 2 == 0 else value_style
+            rendered_row.append(Paragraph(str(cell), style))
+        estimator_table_data.append(rendered_row)
+
+    estimator_table = Table(
+        estimator_table_data,
+        colWidths=[90, 200, 90, 220],
+        hAlign="LEFT",
+    )
+
+    estimator_table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+
+    story.append(estimator_table)
     story.append(Spacer(1, 16))
 
     # ------------------------------------------------------------------
