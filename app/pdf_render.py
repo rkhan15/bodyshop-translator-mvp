@@ -1,4 +1,5 @@
 import io
+import html
 from typing import Dict
 
 import pandas as pd
@@ -14,18 +15,30 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 
+def _p(text, style, bold: bool = False):
+    safe = html.escape(str(text or ""))
+    if bold:
+        safe = f"<b>{safe}</b>"
+    return Paragraph(safe, style)
+
+
+def _is_section_or_total_row(row) -> bool:
+    op = str(row.get("Operation", "") or "").strip()
+    desc = str(row.get("Description", "") or "").strip()
+
+    if op:
+        return False
+
+    if desc.isupper():
+        return True
+
+    if desc.upper().startswith("TOTAL") and "HOURS" in desc.upper():
+        return True
+
+    return False
+
+
 def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> bytes:
-    """
-    Renders:
-    1) Essential header box only:
-       - RO Number
-       - Vehicle Year
-       - Make
-       - Model
-       - Exterior Color
-    2) Landscape translated line-item table with wrapping text
-       - ALL-CAPS section headers rendered bold
-    """
     buffer = io.BytesIO()
 
     doc = SimpleDocTemplate(
@@ -73,7 +86,7 @@ def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> by
         rendered_row = []
         for i, cell in enumerate(row):
             style = label_style if i % 2 == 0 else value_style
-            rendered_row.append(Paragraph(str(cell), style))
+            rendered_row.append(_p(cell, style))
         header_table_data.append(rendered_row)
 
     header_table = Table(
@@ -102,48 +115,60 @@ def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> by
     # ------------------------------------------------------------------
     # TRANSLATED LINE ITEM TABLE
     # ------------------------------------------------------------------
-    table_columns = ["Line", "Qty", "Operation", "Description", "Hours", "Plain English", "Spanish"]
+    include_part_number = (
+        "Part Number" in df.columns
+        and df["Part Number"].fillna("").astype(str).str.strip().ne("").any()
+    )
 
-    # Header row
-    table_data = [[Paragraph(f"<b>{c}</b>", value_style) for c in table_columns]]
+    table_columns = ["Line", "Qty"]
+    if include_part_number:
+        table_columns.append("Part Number")
+
+    table_columns += ["Operation", "Description", "Hours", "Plain English", "Spanish"]
+
+    table_data = [[_p(c, value_style, bold=True) for c in table_columns]]
+
+    row_is_bold = []
 
     for _, row in df.iterrows():
-        op = str(row.get("Operation", "") or "")
-        desc = str(row.get("Description", "") or "")
-
-        is_section_header = (op.strip() == "") and desc.isupper()
+        bold_row = _is_section_or_total_row(row)
+        row_is_bold.append(bold_row)
 
         rendered_cells = []
         for col in table_columns:
             val = str(row.get(col, "") or "")
-
-            if is_section_header and col == "Description":
-                rendered_cells.append(Paragraph(f"<b>{val}</b>", value_style))
-            else:
-                rendered_cells.append(Paragraph(val, value_style))
+            rendered_cells.append(_p(val, value_style, bold=bold_row))
 
         table_data.append(rendered_cells)
 
+    if include_part_number:
+        col_widths = [32, 28, 92, 78, 145, 40, 170, 170]
+    else:
+        col_widths = [38, 32, 90, 170, 46, 180, 180]
+
     line_item_table = Table(
         table_data,
-        colWidths=[38, 32, 90, 170, 46, 180, 180],
+        colWidths=col_widths,
         repeatRows=1,
         hAlign="LEFT",
     )
 
-    line_item_table.setStyle(
-        TableStyle(
-            [
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ]
-        )
-    )
+    style_cmds = [
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]
+
+    # Light gray background for section/total rows.
+    for idx, bold_row in enumerate(row_is_bold, start=1):
+        if bold_row:
+            style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), colors.whitesmoke))
+
+    line_item_table.setStyle(TableStyle(style_cmds))
 
     story.append(line_item_table)
     doc.build(story)
