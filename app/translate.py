@@ -393,8 +393,13 @@ def _parse_priority1_rows(text: str) -> pd.DataFrame:
                 "Hours": "",
             })
 
-        # Priority1 often has blank assigned hours. Keep the total row anyway.
-        total_match = re.search(re.escape(total_marker) + r"\s+(-?\d+(?:\.\d+)?)", raw)
+        # Priority1 blank reports often have no total value, and the next text may be
+        # a timestamp like "2/6/2026" or "12/6/2026". Do NOT treat date numbers as hours.
+        total_match = re.search(
+            re.escape(total_marker) + r"\s+(-?\d+(?:\.\d+)?)(?=\s|$)",
+            raw,
+        )
+
         total_hours = total_match.group(1) if total_match else ""
         _append_total_row(rows, total_label, total_hours)
 

@@ -1,5 +1,6 @@
 import io
 import html
+from datetime import datetime
 from typing import Dict
 
 import pandas as pd
@@ -69,7 +70,9 @@ def render_translation_pdf_bytes(header: Dict[str, str], df: pd.DataFrame) -> by
     title_style = styles["Title"]
 
     story = []
-    story.append(Paragraph("Translated Work Order (English + Spanish)", title_style))
+    today = datetime.now().strftime("%m/%d/%Y")
+    story.append(Paragraph(f"Translated Work Order (English + Spanish) - {today}", title_style))
+
     story.append(Spacer(1, 10))
 
     # ------------------------------------------------------------------
